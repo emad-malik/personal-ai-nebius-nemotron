@@ -97,6 +97,7 @@ class Gate:
         self.bodies: dict[int, str] = {}
         self.answers: dict[int, tuple[str, float]] = {}
         self.lock = threading.Lock()
+        self.why: list[str] = []
 
     def note_draft(self, draft_id: int, body: str) -> None:
         with self.lock:
@@ -108,11 +109,16 @@ class Gate:
         data = _parse_result(result)
         questions = (params or {}).get("questions") or []
         recorded = []
+        self.why = []
+        if not data:
+            self.why.append("result not parseable as a JSON object")
         for i, resp in enumerate(data.get("responses") or []):
             if not isinstance(resp, dict) or resp.get("status") != "answered":
+                self.why.append(f"#{i}: status={resp.get('status') if isinstance(resp, dict) else type(resp).__name__}")
                 continue
             answer = re.sub(r"\s*\(recommended\)$", "", _norm(str(resp.get("user_response", ""))))
             if answer not in {"approve", "edit", "discard"}:
+                self.why.append(f"#{i}: answer={answer!r}")
                 continue
             asked = " ".join(_strings(questions[i])) if i < len(questions) else ""
             shown = " ".join([asked] + [t for k, t in resp.items()
@@ -120,10 +126,12 @@ class Gate:
                                         for t in _strings(t)])
             ids = set(re.findall(r"#(\d+)", asked))
             if len(ids) != 1:
+                self.why.append(f"#{i}: draft ids in question={sorted(ids)}")
                 continue
             draft_id = int(ids.pop())
             body = self.bodies.get(draft_id)
             if body is None or _norm(body) not in _norm(shown):
+                self.why.append(f"#{i}: draft {draft_id} text not found in question (body known: {body is not None})")
                 continue  # the person was not shown the exact draft text
             with self.lock:
                 self.answers[draft_id] = (answer, self.clock())
@@ -287,5 +295,8 @@ def post_tool_call(tool_name, params=None, result=None, gate: Gate = GATE, **kwa
     if tool_name == "clarify":
         recorded = gate.on_clarify(params if isinstance(params, dict) else {}, result)
         event["gate"] = recorded
-        event["result_preview"] = str(result)[:400]  # to confirm the real result shape
+        event["why"] = list(gate.why)
+        data = _parse_result(result)
+        event["shape"] = [{k: str(v)[:40] for k, v in r.items()} for r in (data.get("responses") or [])
+                          if isinstance(r, dict)] or str(result)[-300:]
     audit_write(event)
